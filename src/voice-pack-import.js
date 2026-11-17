@@ -383,13 +383,22 @@ export async function rewriteVenvConfig(dir, { versions = ['313'] } = {}) {
   }
 }
 
+/**
+ * 语音包里的同一个绝对路径可能被写成 / 或 \（Python 侧与 Windows 侧混着来），
+ * 替换锚点必须两种分隔符都认，否则移动目录后路径修不干净。
+ */
+function pathPrefixPattern(value) {
+  const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\//g, '[\\\\/]');
+  return new RegExp(`${escaped}[\\\\/]`, 'g');
+}
+
 /** Repair paths into the copied pack without altering unrelated or user-owned configuration. */
 export async function relocatePackConfig(dir, sourceDir) {
   const file = path.join(dir, 'config.toml');
   const original = await fsp.readFile(file, 'utf8');
   const oldPath = path.resolve(sourceDir).replaceAll('\\', '/');
   const newPath = path.resolve(dir).replaceAll('\\', '/');
-  const updated = original.replaceAll(`${oldPath}/`, `${newPath}/`);
+  const updated = original.replace(pathPrefixPattern(oldPath), () => `${newPath}/`);
   if (updated !== original) await fsp.writeFile(file, updated, 'utf8');
 }
 
@@ -421,7 +430,7 @@ export async function repairMovedVoicePack(dir, id) {
   const stat = await fsp.lstat(config);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('语音配置必须是普通文件');
   let content = await fsp.readFile(config, 'utf8');
-  for (const root of roots) content = content.replaceAll(`${root}/`, `${current}/`);
+  for (const root of roots) content = content.replace(pathPrefixPattern(root), () => `${current}/`);
   await fsp.writeFile(config, content, 'utf8');
   await rewriteVenvConfig(dir, { versions });
   return true;
