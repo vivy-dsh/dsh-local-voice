@@ -232,9 +232,9 @@ window.__ModuleLoader__.load({
         triggerWho: rules?.triggerWho ?? 'owner',
         membersText: (rules?.members ?? []).join(', '),
         groupsText: (rules?.groups ?? []).join(', '),
-        route: rules?.route === 'cloud' ? 'cloud' : 'local',
-        characters: { local: characters.local ?? '', cloud: characters.cloud ?? '' },
-        endpoints: { local: rules?.endpoints?.local ?? '', cloud: rules?.endpoints?.cloud ?? '' },
+        route: ['local', 'cloud', 'dashscope'].includes(rules?.route) ? rules.route : 'local',
+        characters: { local: characters.local ?? '', cloud: characters.cloud ?? '', dashscope: characters.dashscope ?? '' },
+        endpoints: { local: rules?.endpoints?.local ?? '', cloud: rules?.endpoints?.cloud ?? '', dashscope: rules?.endpoints?.dashscope ?? '' },
         maxPerMinute: rules?.maxPerMinute ?? 2,
         maxPerHour: rules?.maxPerHour ?? 10,
         maxSeconds: rules?.maxSeconds ?? 300,
@@ -306,7 +306,7 @@ window.__ModuleLoader__.load({
       const monthlyQuota = readInt(draft.monthlyQuota, '每月额度', 0)
       const bad = firstError(maxPerMinute, maxPerHour, maxSeconds, maxBytes, defaultVolume, ttsTimeoutMs, ttsMaxChars, ttsCacheVersion, pricePerKChar, monthlyQuota)
       if (bad) return bad
-      const route = draft.route === 'cloud' ? 'cloud' : 'local'
+      const route = ['local', 'cloud', 'dashscope'].includes(draft.route) ? draft.route : 'local'
       const loudness = String(draft.loudness ?? '').trim()
       const loud = /^-\d+(?:\.\d+)?$/.test(loudness) ? Number(loudness) : loudness
       if (!(['quiet', 'normal', 'loud'].includes(loud) || (typeof loud === 'number' && loud >= -40 && loud <= -5))) {
@@ -314,8 +314,10 @@ window.__ModuleLoader__.load({
       }
       const character = String(draft.characters?.[route] ?? '').trim()
       if (character.length > 100) return { error: '音色映射名最多 100 个字符' }
-      const endpoints = { local: String(draft.endpoints?.local ?? '').trim(), cloud: String(draft.endpoints?.cloud ?? '').trim() }
-      if (!endpoints.local || !endpoints.cloud) return { error: '两条线路的引擎地址都不能为空' }
+      const endpoints = { local: String(draft.endpoints?.local ?? '').trim(), cloud: String(draft.endpoints?.cloud ?? '').trim(), dashscope: String(draft.endpoints?.dashscope ?? '').trim() }
+      if (!endpoints.local || !endpoints.cloud) return { error: '本地与云端线路的引擎地址都不能为空' }
+      // 世界网关地址只在真的选了那条线路时才要求填，不然别的线路都会被它卡住。
+      if (route === 'dashscope' && !endpoints.dashscope) return { error: '选了世界网关语音包，请填世界网关地址（形如 http://127.0.0.1:3082/dsh-capability-hub/api）' }
       return {
         value: {
           enabled: draft.enabled === true,
@@ -599,7 +601,7 @@ window.__ModuleLoader__.load({
 
       function editTtsRoute(route) {
         const side = state.tts
-        if (!side.draft || !['local', 'cloud'].includes(route)) return
+        if (!side.draft || !['local', 'cloud', 'dashscope'].includes(route)) return
         patch('tts', { draft: { ...side.draft, route }, revision: side.revision + 1, saveError: '', savedMessage: '' })
       }
 
@@ -656,7 +658,7 @@ window.__ModuleLoader__.load({
       }
 
       function setPreviewRoute(route) {
-        patch('tts', { previewRoute: route === 'cloud' ? 'cloud' : 'local', previewError: '' })
+        patch('tts', { previewRoute: ['local', 'cloud', 'dashscope'].includes(route) ? route : 'local', previewError: '' })
       }
 
       function usePreview(blob) {
@@ -1072,7 +1074,7 @@ window.__ModuleLoader__.load({
           row([
             chip(tts.draft.enabled ? '语音已开启' : '语音已关闭', tts.draft.enabled ? 'ok' : 'warn'),
             chip(tts.draft.aiEnabled ? '合成已开启' : '合成已关闭', tts.draft.aiEnabled ? 'ok' : 'warn'),
-            chip(tts.draft.route === 'cloud' ? '云端线路' : '本地线路', 'info'),
+            chip(tts.draft.route === 'cloud' ? '云端线路' : tts.draft.route === 'dashscope' ? '世界网关线路' : '本地线路', 'info'),
             chip(`已安装 ${installed.length} · 运行中 ${running.length}`, running.length ? 'ok' : ''),
           ]),
           check('允许机器人发送语音', tts.draft.enabled, value => store.editTts({ enabled: value })),
@@ -1223,7 +1225,7 @@ window.__ModuleLoader__.load({
         ]),
         card('route', '线路与音色', [
           fields([
-            field('合成线路', select(route, [['local', '本地'], ['cloud', '云端']], value => store.editTtsRoute(value), '合成线路')),
+            field('合成线路', select(route, [['local', '本地'], ['cloud', '云端'], ['dashscope', '世界网关（千问）']], value => store.editTtsRoute(value), '合成线路')),
             field('引擎音色映射名（可留空）', textInput(draft.characters[route], value => store.editTtsCharacter(value), '引擎音色映射名', { maxLength: 100 })),
           ]),
           hint('保存只写入当前线路的音色；另一线路的未保存音色会保留为草稿。'),
@@ -1235,6 +1237,8 @@ window.__ModuleLoader__.load({
             field('本地引擎地址', textInput(draft.endpoints.local, value => store.editTts({ endpoints: { ...draft.endpoints, local: value } }), '本地引擎地址')),
             field('云端包本机地址', textInput(draft.endpoints.cloud, value => store.editTts({ endpoints: { ...draft.endpoints, cloud: value } }), '云端包本机地址')),
           ]),
+          field('世界网关地址', textInput(draft.endpoints.dashscope, value => store.editTts({ endpoints: { ...draft.endpoints, dashscope: value } }), '世界网关地址')),
+          hint('世界网关语音包不用装运行时：TTS 由宿主的世界网关转发到千问。地址形如 http://127.0.0.1:3082/dsh-capability-hub/api，凭据与模型在「世界网关」面板里配。'),
         ]),
         card('limits', '频率与音频限制', [
           fields([
@@ -1340,7 +1344,7 @@ window.__ModuleLoader__.load({
             packButton('启动并切换合成线路', () => { void store.voiceAction('/voice/packs/activate', { id: pack.id }) }, !pack.installed, { primary: true, key: 'activate' }),
             button('停止', () => { void store.voiceAction('/voice/packs/stop', { id: pack.id }) }, { danger: true, key: 'stop', disabled: !pack.running && !pack.managed && voice.startingPack !== pack.id }),
             packButton('测试合成', () => { void store.voiceAction('/voice/packs/test', { id: pack.id }) }, !pack.running || voice.testingPacks.includes(pack.id), { key: 'test' }),
-            ['voice-local', 'voice-cloud'].includes(pack.id) ? packButton('生成试听', () => { void store.previewPack(pack.id) }, !String(tts.previewText ?? '').trim(), { key: 'preview' }) : null,
+            ['voice-local', 'voice-cloud', 'voice-dashscope'].includes(pack.id) ? packButton('生成试听', () => { void store.previewPack(pack.id) }, !String(tts.previewText ?? '').trim(), { key: 'preview' }) : null,
             packButton('移除并保留备份', () => { void store.voiceAction('/voice/packs/archive', { id: pack.id }) }, !pack.dir, { danger: true, key: 'archive' }),
           ]),
           ...(pack.archives || []).map(name => item(`archive-${name}`, [
@@ -1476,7 +1480,7 @@ window.__ModuleLoader__.load({
             ? [
               field('试听文本', textarea(tts.previewText, value => store.setPreviewText(value), '试听文本', { maxLength: MAX_PREVIEW_CHARS })),
               fields([
-                field('试听线路', select(tts.previewRoute, [['local', '本地（voice-local）'], ['cloud', '云端（voice-cloud）']], value => store.setPreviewRoute(value), '试听线路')),
+                field('试听线路', select(tts.previewRoute, [['local', '本地（voice-local）'], ['cloud', '云端（voice-cloud）'], ['dashscope', '世界网关（voice-dashscope）']], value => store.setPreviewRoute(value), '试听线路')),
               ]),
               tts.previewError ? alert(tts.previewError) : null,
               row([button('生成试听', () => { void store.preview() }, { primary: true, busy: tts.previewing, disabled: tts.previewing || !String(tts.previewText ?? '').trim() })]),

@@ -42,6 +42,7 @@ export function voiceProcessPlan(id, dir) {
   const main = { role: 'voice', command: path.join(root, '.venv', 'Scripts', 'pythonw.exe'), cwd: root,
     args: ['-m', 'voxd', '--config', path.join(root, 'config.toml')], env: {} };
   if (id === 'voice-cloud') return [main];
+  if (id === 'voice-dashscope') return []; // 世界网关包由宿主网关提供，没有本机进程可拉
   if (id !== 'voice-local') throw new Error('未知语音包');
   const gsv = path.join(root, 'vendor', 'GPT-SoVITS', 'code');
   return [{ role: 'engine', command: path.join(root, '.venv-gsv', 'Scripts', 'pythonw.exe'), cwd: gsv,
@@ -223,9 +224,45 @@ async function writeState(cfg, state) {
 function manifests(cfg) {
   const extra = Array.isArray(cfg?.voicePacks?.manifests) ? cfg.voicePacks.manifests : [];
   const byId = new Map(DEFAULT_MANIFESTS.map((m) => [m.id, m]));
+  // 世界网关包只有在「接线过」时才出现：没有 `packs/voice-dashscope/config.toml`
+  // 就当它不存在，免得默认多出一个装不了也卸不掉的包把安装/导入路径全带歪。
+  // 顺序要紧：先放完整定义，再让下面的 extra 覆盖字段。反过来的话，extra 里那条只有
+  // `{id, url}` 的补丁会先把 id 占住，`external: true` 与名称、音色就永远加不进来，
+  // 于是它被当成「本地包但端口是空的」，面板上永远显示装好了却没跑起来。
+  if (gatewayEndpointOf(cfg)) byId.set(GATEWAY_PACK.id, GATEWAY_PACK);
   for (const m of extra) byId.set(m.id, { ...byId.get(m.id), ...m });
   return [...byId.values()];
 }
+
+/** 世界网关语音包：没有本机进程，配置与凭据都在宿主的世界网关里，这里只有一个指向它的目录。 */
+const GATEWAY_PACK = {
+  id: 'voice-dashscope',
+  name: '世界网关语音包',
+  version: '1.0.0',
+  sizeBytes: 0,
+  port: null,
+  external: true,
+  requires: { gpu: false, network: true },
+  voices: [{ id: 'Cherry', label: 'Cherry（千问 · 女声）' }],
+  about: {
+    summary: '从世界网关取配置，调用千问云端合成，全部在本机网关里转发。',
+    pros: ['不占显卡、不用装运行时', '音色在网关面板里随时换', '和 ASR / 向量共用一把 key'],
+    cons: ['必须联网', '按字符计费（阿里云收取，与本插件无关）'],
+    billing: '按字符计费，走阿里云百炼账户余额。',
+    disclaimer: '世界网关没启用 tts 插槽时合成会明确报错，不会静默降级。',
+  },
+};
+
+const GATEWAY_ENDPOINT_RE = /^[ \t]*endpoint[ \t]*=[ \t]*"([^"]*)"/m;
+
+/** 读包内 config.toml 里的网关地址；读不到返回 ''。同步是为了让 manifests() 保持同步签名。 */
+function gatewayEndpointOf(cfg) {
+  try {
+    const text = fs.readFileSync(path.join(packDir(cfg, GATEWAY_PACK.id), 'config.toml'), 'utf8');
+    return GATEWAY_ENDPOINT_RE.exec(text)?.[1] ?? '';
+  } catch { return ''; }
+}
+
 
 /** 已知会放语音包的目录（按可信度）：配置目录、仓库根、cwd、用户目录下常见位置。 */
 function cloudEngineRegion(text) {
@@ -293,8 +330,9 @@ function isExternalDir(cfg, id, dir) {
   return path.resolve(dir) !== path.resolve(path.join(packsDir(cfg), id));
 }
 
-/** TCP 探活：给 300ms，够本机服务回应。 */
+/** TCP 探活：给 300ms，够本机服务回应。没有端口的包（世界网关）直接当「不在跑」。 */
 function probePort(port, timeout = 300) {
+  if (!Number.isInteger(port) || port <= 0) return Promise.resolve(false);
   return new Promise((resolve) => {
     const sock = net.connect({ host: '127.0.0.1', port });
     const done = (ok) => {
@@ -425,7 +463,7 @@ export async function ensurePackConfig(dir, { hadOwnConfig = false } = {}) {
   return { created, sanitized: cleaned !== raw, file };
 }
 
-export function createVoicePacks(cfg) {
+export function createVoicePacks(cfg, { getHub } = {}) {
   const activeInstalls = new Map(); // id → {progress, phase, startedAt, error}
   const activeImports = new Map(); // id → 导入进度/错误（离线包复制与切换）
   const ownedProcesses = new Map();
@@ -788,9 +826,54 @@ export function createVoicePacks(cfg) {
   }
 
 
+  async function probeGateway(cfgLike) {
+    const endpoint = gatewayEndpointOf(cfgLike);
+    if (!endpoint) return { ok: false, error: '还没接世界网关：跑 npm run setup:capability-hub 接线后再试' };
+    // 世界网关就在同一个进程里：直接问它，别 fetch 自己的 HTTP 面。
+    // 服务端请求没有浏览器会话，走 HTTP 一定被拒成 401，于是面板上这个包永远显示「没跑起来」。
+    const hub = typeof getHub === 'function' ? getHub() : undefined;
+    if (hub && typeof hub.status === 'function') {
+      try {
+        const health = await hub.status('tts');
+        if (!health?.ready) return { ok: false, endpoint, tts: health, error: String(health?.error || '网关的 tts 插槽没启用') };
+        return { ok: true, endpoint, tts: health };
+      } catch (error) {
+        return { ok: false, error: `连不上世界网关：${String(error?.message ?? error)}` };
+      }
+    }
+    // 网关不在本进程（独立部署）时才退回 HTTP；这条路要求对方没有会话校验。
+    try {
+      const res = await fetch(`${endpoint.replace(/\/+$/, '')}/health`, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(4000),
+      });
+      const body = await res.text().catch(() => '');
+      if (!res.ok) return { ok: false, status: res.status, error: `网关返回 ${res.status}：${body.slice(0, 200)}` };
+      let json = null;
+      try { json = JSON.parse(body); } catch {}
+      const tts = json?.slots?.tts ?? json?.tts ?? null;
+      if (tts && tts.ready === false) return { ok: false, status: res.status, tts, error: String(tts.error || '网关的 tts 插槽没启用') };
+      return { ok: true, status: res.status, endpoint, tts };
+    } catch (error) {
+      return { ok: false, error: `连不上世界网关：${String(error?.message ?? error)}` };
+    }
+  }
+
   async function statusOne(m) {
     const dir = packDir(cfg, m.id);
     const hasFiles = await exists(path.join(dir, 'config.toml'));
+    // 世界网关包没有本机进程：「装好了」= 有 config.toml，「在跑」= 网关的 tts 插槽能用。
+    if (m.external) {
+      const ready = hasFiles ? await probeGateway(cfg) : { ok: false, error: '还没接线' };
+      return {
+        id: m.id, name: m.name, version: m.version, sizeBytes: m.sizeBytes,
+        port: null, enginePort: null, engineUp: null,
+        requires: m.requires, voices: m.voices, about: m.about,
+        installed: hasFiles, running: ready.ok === true,
+        managed: false, external: true,
+        dir: hasFiles ? dir : null, gateway: ready, install: null, import: null,
+      };
+    }
     const portUp = await probePort(m.port);
     const engineUp = m.enginePort ? await probePort(m.enginePort) : null;
     // 「外部安装」两种：① 文件在别的目录（旧默认目录/cwd，2026-10-28 用户反馈）；② 只有端口在跑。
@@ -1022,6 +1105,10 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
 
   async function remove(id) {
     const dir = packDir(cfg, id);
+    // 世界网关包没有运行时也没有本机进程；「卸载」等于把接线产物删掉，只能重新接线。
+    if (id === GATEWAY_PACK.id) {
+      return { ok: false, error: '世界网关语音包由宿主提供，不能在这里卸载；不想用就切到别的线路（配置仍保留）' };
+    }
     await stop(id).catch(() => {});
     if (hasOwnedVoiceWorkers(ownedProcesses, id)) return { ok: false, error: '语音包仍有插件管理的进程未退出，请先停止后再卸载' };
     // 端口还在 → 说明有进程占着目录，直接删会 EBUSY；给用户明确提示而不是抛原始错误。
@@ -1052,6 +1139,12 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
     signal?.throwIfAborted();
     const m = manifests(cfg).find((x) => x.id === id);
     if (!m) throw new Error(`未知语音包：${id}`);
+    // 世界网关包没有本机进程：启不启用由网关那边决定，这里只回报状态。
+    if (id === GATEWAY_PACK.id) {
+      const ready = await probeGateway(cfg);
+      if (!ready.ok) return { ok: false, error: ready.error, gateway: ready };
+      return { ok: true, already: true, gateway: ready };
+    }
     assertNoManagedVoiceWorkers(ownedProcesses, id);
     if (process.platform !== 'win32') throw new Error('当前语音包只提供 Windows 启动脚本；请使用受支持的本地引擎');
     const dir = packDir(cfg, id);
@@ -1154,6 +1247,8 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
   async function stop(id) {
     const m = manifests(cfg).find((x) => x.id === id);
     if (!m) throw new Error(`未知语音包：${id}`);
+    // 世界网关包没有本机进程可停；也别假装停掉了。
+    if (id === GATEWAY_PACK.id) return { ok: true, already: true, external: true };
     const children = ownedProcesses.get(id) || [];
     if (!children.length) {
       if (!(await probePort(m.port))) return { ok: true, already: true };
@@ -1270,14 +1365,16 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
   async function activate(id) {
     const m = manifests(cfg).find((x) => x.id === id);
     if (!m) throw new Error(`未知语音包：${id}`);
+    // 世界网关包没有端口，不能去探 port null；它自己的健康检查在 start() 里做。
     for (const other of manifests(cfg)) {
-      if (other.id === id) continue;
+      if (other.id === id || other.external || !other.port) continue;
       if (await probePort(other.port)) await stop(other.id).catch(() => {});
     }
-    if (!(await probePort(m.port))) {
+    if (m.external || !(await probePort(m.port))) {
       const r = await start(id);
       if (r.ok === false) return r;
     }
+    const route = id === GATEWAY_PACK.id ? 'dashscope' : (id === 'voice-cloud' ? 'cloud' : 'local');
     // 顺手把路由切过去（写 config.json，宿主热读）
     try {
       const cfgPath = cfg.configPath;
@@ -1285,12 +1382,12 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
       disk.socialV2 = disk.socialV2 || {};
       disk.socialV2.voice = disk.socialV2.voice || {};
       disk.socialV2.voice.tts = disk.socialV2.voice.tts || {};
-      disk.socialV2.voice.tts.route = id === 'voice-cloud' ? 'cloud' : 'local';
+      disk.socialV2.voice.tts.route = route;
       // 只要切路由，不能顺手把开关关掉（曾经因此出现“语音合成还没开启”）
       disk.socialV2.voice.tts.enabled = true;
       await fsp.writeFile(cfgPath, JSON.stringify(disk, null, 2) + '\n', 'utf8');
     } catch {}
-    return { ok: true, route: id === 'voice-cloud' ? 'cloud' : 'local', port: m.port };
+    return { ok: true, route, port: m.external ? null : m.port };
   }
 
   /** 启用/停用（不影响安装状态，只影响宿主是否把它当作可用语音源）。 */
@@ -1427,11 +1524,31 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
     signal?.throwIfAborted();
     const m = manifests(cfg).find((x) => x.id === id);
     if (!m) throw new Error(`未知语音包：${id}`);
-    if (!(await probePort(m.port))) throw new Error('服务没在运行，先点「启动」');
-    signal?.throwIfAborted();
     const t0 = Date.now();
     const timeout = AbortSignal.timeout(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, 120000) : 120000);
-    const res = await fetch(`http://127.0.0.1:${m.port}/v1/speak/file`, {
+    let url;
+    if (id === GATEWAY_PACK.id) {
+      const ready = await probeGateway(cfg);
+      if (!ready.ok) throw new Error(ready.error);
+      // 「测试合成」也不能 fetch 自己的网关：服务端请求没有浏览器会话，一定 401。
+      const hub = typeof getHub === 'function' ? getHub() : undefined;
+      if (hub && typeof hub.speak === 'function') {
+        let result;
+        try { result = await hub.speak('tts', { text }); }
+        catch (error) { throw new Error(`合成失败：${String(error?.message ?? error)}`); }
+        signal?.throwIfAborted();
+        const buf = result.audio;
+        let seconds = 0;
+        try { seconds = +(wavDurationMs(buf) / 1000).toFixed(2); } catch { seconds = +(Number(result.durationMs || 0) / 1000).toFixed(2); }
+        return { ok: true, ms: Date.now() - t0, bytes: buf.length, seconds, duration: seconds };
+      }
+      url = `${ready.endpoint.replace(/\/+$/, '')}/tts`;
+    } else {
+      if (!(await probePort(m.port))) throw new Error('服务没在运行，先点「启动」');
+      url = `http://127.0.0.1:${m.port}/v1/speak/file`;
+    }
+    signal?.throwIfAborted();
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text }),
@@ -1450,6 +1567,8 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
   async function isOwnedRunning(id) {
     const m = manifests(cfg).find((x) => x.id === id);
     const children = ownedProcesses.get(id) || [];
+    // 世界网关包没有进程也没有端口：网关接上了就算可用。
+    if (m?.external) return (await probeGateway(cfg)).ok;
     if (!m || !hasVoiceServiceWorker(children)) return false;
     const up = await probePort(m.port);
     return Boolean(up && hasVoiceServiceWorker(children));

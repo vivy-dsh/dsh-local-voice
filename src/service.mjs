@@ -19,6 +19,25 @@ function localEndpoint(input) {
   return url.origin
 }
 
+/**
+ * 世界网关线路的地址是宿主自己的回环网关，但**带路径**（`http://127.0.0.1:<port>/dsh-capability-hub/api`），
+ * 所以不能套 `localEndpoint` 那条「只准 origin」的校验。
+ */
+function gatewayEndpoint(input) {
+  let url
+  try { url = new URL(String(input)) } catch { throw new Error('世界网关地址无效') }
+  if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.search || url.hash) throw new Error('世界网关地址必须是本机 HTTP 地址')
+  return url.origin + url.pathname.replace(/\/+$/, '')
+}
+
+/** 三条线路与语音包 id 的对应关系：单点定义，别在别处再写一份。 */
+const ROUTE_PACKS = { local: 'voice-local', cloud: 'voice-cloud', dashscope: 'voice-dashscope' }
+const ROUTES = Object.keys(ROUTE_PACKS)
+const routeOfPack = id => ROUTES.find(route => ROUTE_PACKS[route] === id) ?? ''
+const packOfRoute = route => ROUTE_PACKS[route] ?? ROUTE_PACKS.local
+/** `local` / `cloud` 是本机常驻进程；`dashscope` 由宿主网关提供，没有端口。 */
+const isLoopbackRoute = route => route === 'local' || route === 'cloud'
+
 /** The orchestrator's Effect-backed voice host; attached by the plugin once that service exists. Sends are refused until one is attached. */
 let effectHost = null
 /** Results of committed sends by token, so a repeated commit returns the first result instead of sending again. */
@@ -46,8 +65,12 @@ function rememberSend(token, result) {
   while (committedSends.size > COMMITTED_SENDS_LIMIT) committedSends.delete(committedSends.keys().next().value)
 }
 
-export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = createVoicePacks, createInstaller = createOnlineVoiceInstaller, checkSendReadiness = async () => ({ ok: false, error: 'QQ 桥接状态不可用' }), probeLibrary, sendLibraryVoice = async () => { throw new Error('QQ 桥接状态不可用') } }) {
+export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = createVoicePacks, createInstaller = createOnlineVoiceInstaller, checkSendReadiness = async () => ({ ok: false, error: 'QQ 桥接状态不可用' }), probeLibrary, sendLibraryVoice = async () => { throw new Error('QQ 桥接状态不可用') }, getHub = () => undefined }) {
   if (!stateDir) throw new Error('Voice state directory is required')
+  /** 世界的网关服务是可选依赖：没装、没起来、老版本，都只是退回 HTTP，不该让语音挂掉。 */
+  const detectHub = () => {
+    try { return typeof getHub === 'function' ? getHub() : undefined } catch { return undefined }
+  }
   const file = join(stateDir, 'config.json')
   const saved = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {}
   const voice = saved.voice ?? {}
@@ -62,10 +85,12 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
   voicePacks.manifests = [
     { id: 'voice-local', url: join(stateDir, 'sources', 'voice-local') },
     { id: 'voice-cloud', url: join(stateDir, 'sources', 'voice-cloud') },
+    { id: 'voice-dashscope', url: join(stateDir, 'sources', 'voice-dashscope') },
     ...(Array.isArray(saved.voicePacks?.manifests) ? saved.voicePacks.manifests.filter(item => /^[a-z0-9][a-z0-9_-]{0,63}$/.test(String(item?.id ?? ''))) : []),
   ]
   const cfg = { voicePacks, socialV2: { voice }, configPath: file }
-  const packs = createPacks(cfg)
+  // 探活也走进程内（与合成同一条理由）：语音包在不在跑，问网关自己，不 fetch 它。
+  const packs = createPacks(cfg, { getHub: detectHub })
   const installer = createInstaller({ stateDir })
   let operations = Promise.resolve()
   let closing = false
@@ -247,7 +272,7 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
     updateLiveVoice(next)
   }
   function switchVoiceRoute(tts, route) {
-    const oldRoute = tts.route === 'cloud' ? 'cloud' : 'local'
+    const oldRoute = normalizeRoute(tts.route)
     if (route === oldRoute) return { ...tts, route }
     const selections = tts.routeVoiceSelections ?? {}
     if (!selections || typeof selections !== 'object' || Array.isArray(selections)) throw new Error('线路音色记录无效，已保留原配置')
@@ -298,13 +323,61 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
     }
     return [...names]
   }
-  function synthesizeCore({ text, baseUrl, character, voice: voiceId, style, timeoutMs, cacheVersion } = {}, { defaultVoice = false, routeVoice } = {}) {
+  /** 线路名收敛：认不出来的值一律当 `local`，保持旧配置的行为。 */
+  function normalizeRoute(value) { return ROUTES.includes(value) ? value : 'local' }
+  /** 一条线路的默认地址。`dashscope` 必须显式配置：不知道宿主网关端口就不能瞎猜。 */
+  function defaultEndpoint(route) {
+    if (route === 'cloud') return 'http://127.0.0.1:8767'
+    if (route === 'dashscope') return ''
+    return 'http://127.0.0.1:8765'
+  }
+  /** 解析线路地址：显式 baseUrl > 配置里的 endpoints > 该线路默认值。 */
+  function resolveEndpoint(route, baseUrl) {
+    const raw = baseUrl || voice.tts?.endpoints?.[route] || (route === 'local' ? voice.tts?.baseUrl : '') || defaultEndpoint(route)
+    if (!String(raw ?? '').trim()) throw new Error('世界网关语音包还没配置网关地址：到「语音」页填好后再试')
+    return isLoopbackRoute(route) ? localEndpoint(raw) : gatewayEndpoint(raw)
+  }
+  /**
+ * 世界网关和语音插件跑在同一个宿主进程里。
+ *
+ * 走 HTTP 的话，服务端发起的请求没有浏览器会话，会被网关的会话校验拒成
+ * 401「会话未通过验证」——这不是配置问题，是根本走不通。所以这里把一次 fetch
+ * 转成一次进程内调用，并把结果包成 `Response`，让 `synthesizeToFile` 的缓存、
+ * wav 头修复、时长兜底全都不用改。
+ *
+ * 网关没提供这个服务（比如老版本）时返回 undefined，调用方继续走 HTTP。
+ */
+function gatewayFetch(hub) {
+  return async (url, init = {}) => {
+    const payload = init.body ? JSON.parse(String(init.body)) : {}
+    try {
+      const result = await hub.speak('tts', { text: payload.text, voice: payload.voice || payload.character })
+      return new Response(result.audio, {
+        status: 200,
+        headers: {
+          'content-type': result.mime || 'audio/wav',
+          'x-duration-ms': String(result.durationMs || 0),
+          'x-tts-model': String(result.model ?? ''),
+          'x-tts-voice': String(result.voice ?? '')
+        }
+      })
+    } catch (error) {
+      // 保住 HTTP 那条路径的错误形状：非 2xx + JSON 体，`synthesizeToFile` 才能把原话带给用户。
+      return new Response(JSON.stringify({ ok: false, code: error?.code ?? 'SYNTHESIS_FAILED', error: String(error?.message ?? error) }), {
+        status: Number(error?.status) || 502,
+        headers: { 'content-type': 'application/json; charset=utf-8' }
+      })
+    }
+  }
+}
+
+function synthesizeCore({ text, baseUrl, character, voice: voiceId, style, timeoutMs, cacheVersion } = {}, { defaultVoice = false, routeVoice } = {}) {
     shutdown.signal.throwIfAborted()
     refreshVoice()
     const say = String(text ?? '').trim(), maxChars = maxSynthesisChars()
     if (say.length > maxChars) throw new Error(`要说的话最多 ${maxChars} 字（收到 ${say.length}）`)
-    const route = voice.tts?.route === 'cloud' ? 'cloud' : 'local'
-    const endpoint = localEndpoint(baseUrl || voice.tts?.endpoints?.[route] || (route === 'local' ? voice.tts?.baseUrl : '') || (route === 'cloud' ? 'http://127.0.0.1:8767' : 'http://127.0.0.1:8765'))
+    const route = normalizeRoute(voice.tts?.route)
+    const endpoint = resolveEndpoint(route, baseUrl)
     const timeout = timeoutMs ?? voice.tts?.timeoutMs
     let cloudEndpoint = ''
     try { cloudEndpoint = localEndpoint(voice.tts?.endpoints?.cloud || 'http://127.0.0.1:8767') } catch {}
@@ -317,12 +390,17 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
     }
     const version = cacheVersion ?? voice.tts?.cacheVersion ?? null
     const effectiveVersion = endpoint === cloudEndpoint ? [version, cloudVoiceFingerprint()] : version
-    if (routeVoice !== undefined && !['local', 'cloud'].includes(routeVoice)) throw new Error('无效的语音线路')
+    if (routeVoice !== undefined && !ROUTES.includes(routeVoice)) throw new Error('无效的语音线路')
     const target = routeVoice ? switchVoiceRoute(voice.tts ?? {}, routeVoice) : null
     const selectedCharacter = target ? target.character || '' : defaultVoice || voiceId ? '' : character || voice.tts?.character
     const selectedVoice = target ? (selectedCharacter ? '' : target.voice || '') : defaultVoice ? '' : voiceId || (selectedCharacter ? '' : voice.tts?.voice)
+    const hub = isLoopbackRoute(route) ? undefined : detectHub()
     return synthesizeToFile({ text: say, character: selectedCharacter, voice: selectedVoice, style,
-      baseUrl: endpoint, outDir: join(stateDir, 'cache'), fetchImpl,
+      baseUrl: endpoint, outDir: join(stateDir, 'cache'),
+      // 网关在线路上有进程内服务就直接调它；否则退回 HTTP（老版本 / 独立部署）。
+      fetchImpl: hub && typeof hub.speak === 'function' ? gatewayFetch(hub) : fetchImpl,
+      // 世界网关是 `/tts`，voxd 是 `/v1/speak/file`：路线不同，路径也不同。
+      speakPath: isLoopbackRoute(route) ? '/v1/speak/file' : '/tts',
       timeoutMs: Number.isFinite(Number(timeout)) && Number(timeout) > 0 ? Math.min(120000, Number(timeout)) : 60000,
       cacheVersion: effectiveVersion, signal: shutdown.signal })
   }
@@ -335,12 +413,12 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
   }
   async function preview(id, text) {
     refreshVoice()
-    if (!['voice-local', 'voice-cloud'].includes(id)) throw new Error('未知语音包')
+    const route = routeOfPack(id)
+    if (!route) throw new Error('未知语音包')
     const sample = String(text ?? '')
     if (sample.length > 500) throw new Error('试听文本最多 500 字')
-    const route = id === 'voice-cloud' ? 'cloud' : 'local'
-    const baseUrl = voice.tts?.endpoints?.[route] || (route === 'local' ? voice.tts?.baseUrl : '') || (route === 'cloud' ? 'http://127.0.0.1:8767' : 'http://127.0.0.1:8765')
-    const activeRoute = voice.tts?.route === 'cloud' ? 'cloud' : 'local'
+    const baseUrl = resolveEndpoint(route)
+    const activeRoute = normalizeRoute(voice.tts?.route)
     if (route === activeRoute) return synthesize({ text: sample, baseUrl })
     const target = switchVoiceRoute(voice.tts ?? {}, route)
     const character = target.character || '', voiceId = character ? '' : target.voice || ''
@@ -611,9 +689,9 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
       let defaultVoiceNotice = false
       try {
         const disk = readDiskConfig(), next = structuredClone(disk.voice ?? {})
-        const previous = next.tts ?? {}, route = id === 'voice-cloud' ? 'cloud' : 'local'
+        const previous = next.tts ?? {}, route = routeOfPack(id) || 'local'
         next.tts = { ...switchVoiceRoute(previous, route), enabled: true }
-        defaultVoiceNotice = (previous.route === 'cloud' ? 'cloud' : 'local') !== route && !!(previous.character || previous.voice) && !(next.tts.character || next.tts.voice)
+        defaultVoiceNotice = normalizeRoute(previous.route) !== route && !!(previous.character || previous.voice) && !(next.tts.character || next.tts.voice)
         persist(next, disk)
       } catch (error) {
         if (!already) {
@@ -636,29 +714,29 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
           } catch (error) { warnings.push(`旧语音包 ${other.id} 未能停止：${String(error?.message ?? error)}`) }
         }
       } catch (error) { warnings.push(`无法检查旧语音包：${String(error?.message ?? error)}`) }
-      return { ...started, ok: true, route: id === 'voice-cloud' ? 'cloud' : 'local', ...(warnings.length ? { warning: warnings.join('；') } : {}) }
+      return { ...started, ok: true, route: routeOfPack(id) || 'local', ...(warnings.length ? { warning: warnings.join('；') } : {}) }
     }) },
     async rules() {
       refreshVoice()
-      const ttsCharactersByRoute = { local: [], cloud: [] }, ttsCharacterErrorsByRoute = {}
-      for (const route of ['local', 'cloud']) {
-        try { ttsCharactersByRoute[route] = voiceCharacters([`voice-${route}`]) }
+      const ttsCharactersByRoute = { local: [], cloud: [], dashscope: [] }, ttsCharacterErrorsByRoute = {}
+      for (const route of ROUTES) {
+        try { ttsCharactersByRoute[route] = voiceCharacters([packOfRoute(route)]) }
         catch (error) { ttsCharacterErrorsByRoute[route] = String(error?.message ?? error) }
       }
-      const selectedRoute = voice.tts?.route === 'cloud' ? 'cloud' : 'local'
+      const selectedRoute = normalizeRoute(voice.tts?.route)
       const savedSelections = voice.tts?.routeVoiceSelections
-      const ttsCharacterByRoute = Object.fromEntries(['local', 'cloud'].map(route => [route, typeof savedSelections?.[route]?.character === 'string' ? savedSelections[route].character : '']))
+      const ttsCharacterByRoute = Object.fromEntries(ROUTES.map(route => [route, typeof savedSelections?.[route]?.character === 'string' ? savedSelections[route].character : '']))
       ttsCharacterByRoute[selectedRoute] = typeof voice.tts?.character === 'string' ? voice.tts.character : ''
       return { ok: true, enabled: voice.enabled === true, triggerWho: voice.trigger?.who || 'owner', members: voice.trigger?.members ?? [], groups: voice.trigger?.groups ?? [], maxPerMinute: voice.maxPerMinute ?? 2, maxPerHour: voice.maxPerHour ?? 10, maxSeconds: voice.maxSeconds ?? 300, maxBytes: voice.maxBytes ?? 20 * 1024 * 1024,
       defaultVolume: voice.defaultVolume ?? 1, loudness: voice.loudness ?? 'normal', autoReadback: voice.autoReadback !== false, ffmpegPath: voice.ffmpegPath ?? '', ffprobePath: voice.ffprobePath ?? '',
-      ttsTimeoutMs: voice.tts?.timeoutMs ?? 60000, ttsMaxChars: voice.tts?.maxChars ?? 120, ttsCharacter: voice.tts?.character ?? '', ttsCharacterByRoute, ttsCharacterSavedByRoute: { ...ttsCharacterByRoute }, ttsCharacters: [...new Set([...ttsCharactersByRoute.local, ...ttsCharactersByRoute.cloud])], ttsCharactersByRoute, ttsCharacterErrorsByRoute, ttsCacheVersion: voice.tts?.cacheVersion ?? 0,
-      aiEnabled: voice.tts?.enabled === true, route: ['local', 'cloud'].includes(voice.tts?.route) ? voice.tts.route : 'local',
-      endpoints: { local: voice.tts?.endpoints?.local || voice.tts?.baseUrl || 'http://127.0.0.1:8765', cloud: voice.tts?.endpoints?.cloud || 'http://127.0.0.1:8767' },
+      ttsTimeoutMs: voice.tts?.timeoutMs ?? 60000, ttsMaxChars: voice.tts?.maxChars ?? 120, ttsCharacter: voice.tts?.character ?? '', ttsCharacterByRoute, ttsCharacterSavedByRoute: { ...ttsCharacterByRoute }, ttsCharacters: [...new Set(ROUTES.flatMap(route => ttsCharactersByRoute[route] ?? []))], ttsCharactersByRoute, ttsCharacterErrorsByRoute, ttsCacheVersion: voice.tts?.cacheVersion ?? 0,
+      aiEnabled: voice.tts?.enabled === true, route: normalizeRoute(voice.tts?.route),
+      endpoints: { local: voice.tts?.endpoints?.local || voice.tts?.baseUrl || 'http://127.0.0.1:8765', cloud: voice.tts?.endpoints?.cloud || 'http://127.0.0.1:8767', dashscope: voice.tts?.endpoints?.dashscope || '' },
       pricePerKChar: Number(voice.cloud?.pricePerKChar) || 0, monthlyQuota: Number(voice.cloud?.monthlyQuota) || 0 } },
     async selfCheck() {
       refreshVoice()
-      const route = voice.tts?.route === 'cloud' ? 'cloud' : 'local'
-      const endpoint = localEndpoint(voice.tts?.endpoints?.[route] || (route === 'local' ? voice.tts?.baseUrl : '') || (route === 'cloud' ? 'http://127.0.0.1:8767' : 'http://127.0.0.1:8765'))
+      const route = normalizeRoute(voice.tts?.route)
+      const endpoint = resolveEndpoint(route)
       const stages = []
       try {
         const response = await fetchImpl(`${endpoint}/v1/health`, { redirect: 'error', signal: AbortSignal.timeout(3000) })
@@ -741,20 +819,25 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
       if (input.endpoints !== undefined) {
         if (!input.endpoints || typeof input.endpoints !== 'object' || Array.isArray(input.endpoints)) throw new Error('Invalid voice endpoints')
         for (const key of ['local', 'cloud']) if (input.endpoints[key] !== undefined) endpoints[key] = localEndpoint(input.endpoints[key])
+        // 世界网关地址带路径（`/dsh-capability-hub/api`），不能过 localEndpoint 那个「只准 origin」的校验。
+        if (input.endpoints.dashscope !== undefined) {
+          const value = String(input.endpoints.dashscope ?? '').trim()
+          endpoints.dashscope = value ? gatewayEndpoint(value) : ''
+        }
       }
       const disk = readDiskConfig(), voice = structuredClone(disk.voice ?? {})
-      const oldTts = voice.tts ?? {}, oldRoute = oldTts.route === 'cloud' ? 'cloud' : 'local'
-      const route = ['local', 'cloud'].includes(input.route) ? input.route : oldRoute
+      const oldTts = voice.tts ?? {}, oldRoute = normalizeRoute(oldTts.route)
+      const route = ROUTES.includes(input.route) ? input.route : oldRoute
       const routeTts = switchVoiceRoute(oldTts, route)
-      const endpointFor = (which, saved, changed = {}) => changed[which] || saved.endpoints?.[which] || (which === 'local' ? saved.baseUrl : '') || (which === 'cloud' ? 'http://127.0.0.1:8767' : 'http://127.0.0.1:8765')
-      const endpoint = localEndpoint(endpointFor(route, oldTts, endpoints))
-      const oldEndpoint = localEndpoint(endpointFor(oldRoute, oldTts))
+      const endpointFor = (which, saved, changed = {}) => changed[which] || saved.endpoints?.[which] || (which === 'local' ? saved.baseUrl : '') || defaultEndpoint(which)
+      const endpoint = isLoopbackRoute(route) ? localEndpoint(endpointFor(route, oldTts, endpoints)) : gatewayEndpoint(endpointFor(route, oldTts, endpoints) || '')
+      const oldEndpoint = isLoopbackRoute(oldRoute) ? localEndpoint(endpointFor(oldRoute, oldTts)) : gatewayEndpoint(endpointFor(oldRoute, oldTts) || '')
       const name = String(input.ttsCharacter ?? routeTts.character ?? '').trim()
       const changed = name !== String(oldTts.character ?? '').trim() || route !== oldRoute || endpoint !== oldEndpoint
-      const manifest = (Array.isArray(disk.voicePacks?.manifests) ? disk.voicePacks.manifests : []).findLast(item => item?.id === `voice-${route}`)
+      const manifest = (Array.isArray(disk.voicePacks?.manifests) ? disk.voicePacks.manifests : []).findLast(item => item?.id === packOfRoute(route))
       const packPort = Number(manifest?.port) || (route === 'cloud' ? 8767 : 8765)
       if (name && changed && input.allowUnverifiedCharacter !== true && Number(new URL(endpoint).port) === packPort) {
-        const names = voiceCharacters([`voice-${route}`])
+        const names = voiceCharacters([packOfRoute(route)])
         if (names.length && !names.includes(name)) {
           const hint = /-(gsv|cloud)$|^huayan$/i.test(name) ? `「${name}」是音色 ID，映射名可用：${names.join('、')}` : `映射名「${name}」不存在；可用映射名：${names.join('、')}`
           throw new Error(hint)
@@ -779,7 +862,7 @@ export function createVoiceService({ stateDir, fetchImpl = fetch, createPacks = 
       if (input.ttsCharacter !== undefined) voice.tts.character = input.ttsCharacter.trim()
       if (Object.keys(endpoints).length) voice.tts.endpoints = { ...(voice.tts.endpoints ?? {}), ...endpoints }
       if (typeof input.aiEnabled === 'boolean') voice.tts.enabled = input.aiEnabled
-      if (['local', 'cloud'].includes(input.route)) voice.tts.route = input.route
+      if (ROUTES.includes(input.route)) voice.tts.route = input.route
       voice.cloud = { ...(voice.cloud ?? {}) }
       if (input.pricePerKChar !== undefined) voice.cloud.pricePerKChar = Number(input.pricePerKChar)
       if (input.monthlyQuota !== undefined) voice.cloud.monthlyQuota = Number(input.monthlyQuota)

@@ -17,11 +17,20 @@ export function apply(ctx) {
     qqConfigFile: resolveComponentPath(env, 'SURFCORE_CONFIG_FILE', join(home, 'surfcore', 'config.json'), { label: 'QQ 桥接配置' }),
     tokenFile: resolveComponentPath(env, 'SURFCORE_CONSOLE_TOKEN_FILE', join(home, 'surfcore', 'state', 'console-token'), { label: 'QQ 桥接令牌' }),
   }
-  const service = createVoiceService({ stateDir, checkSendReadiness: createVoiceBridgeReadiness(bridgeConfig), sendLibraryVoice: createVoiceLibrarySender(bridgeConfig) })
+  // 世界网关与语音插件在同一进程：合成走进程内服务，不走 HTTP——服务端发起的请求
+  // 没有浏览器会话，打网关的 HTTP 面必然 401。这里按 Cordis 的方式订阅服务：
+  // 网关没装或没起来，回调就不触发，service 自动退回 HTTP。
+  let hub
+  const service = createVoiceService({ stateDir, checkSendReadiness: createVoiceBridgeReadiness(bridgeConfig), sendLibraryVoice: createVoiceLibrarySender(bridgeConfig), getHub: () => hub })
   const picker = createImportPicker({ stateDir })
   const dispose = registerVoiceHttp(ctx, service, { chooseDirectory: () => picker.choose() })
   let disposeInternal
   try { disposeInternal = registerVoiceInternal(ctx, home, service) } catch (error) { dispose(); throw error }
+  // 网关服务是可选的：装上并起来之后这个回调才触发，`hub` 才有值。
+  ctx.inject(['capabilityHub'], child => {
+    hub = child.capabilityHub ?? undefined
+    return () => { hub = undefined }
+  })
   ctx.inject(['orchestrator'], child => {
     // Runtime registers the orchestrator service before it constructs its voice host; one microtask sees it.
     const attach = () => {

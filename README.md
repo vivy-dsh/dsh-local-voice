@@ -64,7 +64,7 @@ DSH_HOME/voice/
 `config.json` 的主要字段：
 
 - `voice.enabled`、`voice.tts.enabled`：总开关与 AI 合成开关，默认关闭。
-- `voice.tts.route`（`local` / `cloud`）、`voice.tts.character`、`voice.tts.voice`、
+- `voice.tts.route`（`local` / `cloud` / `dashscope`）、`voice.tts.character`、`voice.tts.voice`、
   `voice.tts.endpoints`、`voice.tts.timeoutMs`、`voice.tts.maxChars`、
   `voice.tts.cacheVersion`。
 - `voice.trigger.who`、`voice.trigger.members`、`voice.trigger.groups`。
@@ -79,6 +79,42 @@ DSH_HOME/voice/
 
 写入使用同目录临时文件 + rename，并保留文件中的其他段。云端凭据写在对应语音包的
 `config.toml` 的 `[engine]` 段；保存前校验密钥、音色目录和 JSON，密钥留空不覆盖原值。
+
+## 世界网关语音包（`voice-dashscope`）
+
+第三条线路：本机没有任何语音进程，合成交给宿主的世界网关，由它转发到阿里云百炼千问。
+和另外两个包的区别只有一处——**它没有端口**：
+
+| | `voice-local` / `voice-cloud` | `voice-dashscope` |
+| --- | --- | --- |
+| 运行时 | voxd（Python + 显卡） | 无 |
+| 端口 | 8765 / 8767 | 无（`port: null`） |
+| 合成请求 | `POST {endpoint}/v1/speak/file` | `POST {endpoint}/tts` |
+| 「在跑」的意思 | 端口有人应答 | 网关 `/health` 说 tts 插槽就绪 |
+| 凭据 | 包内 `config.toml` 的 `[engine]` | 世界网关的 `DASHSCOPE_API_KEY` |
+| 停 / 卸 | 杀进程 / 删目录 | 都没有：停是空操作，卸载被拒绝 |
+
+接线（幂等）与配置默认值都走一个脚本，它只写状态、不写代码也不碰凭据：
+
+```bash
+npm run setup:capability-hub
+# 想换模型或域名：
+DSH_TTS_MODEL=qwen-audio-3.1-tts-flash DSH_TTS_BASE_URL=https://xxx.cn-beijing.maas.aliyuncs.com npm run setup:capability-hub
+```
+
+它产出两样东西：`.artifacts/dsh-home/voice/packs/voice-dashscope/config.toml`（只有
+`[engine].endpoint`，指向 `http://127.0.0.1:<端口>/dsh-capability-hub/api`）和
+`capability-hub/registry.json` 里启用的 `tts` 插槽。**没有这个 config.toml 时，这个包在
+包列表里根本不会出现**——没接线就没有半残的第三条线路。
+
+剩下的两件事必须手工：在「世界网关」面板填 `baseURL`（工作空间域名）与凭据。填完重启宿主，
+在「语音」页选「世界网关（千问）」线路试听。
+
+上游契约（`plugins/capability-hub/src/http.mjs` 的 `POST /tts`）：请求体
+`{"text": "...", "voice": "Cherry"}`，响应是 wav 字节，`X-Duration-Ms` 给时长。凭据在服务端
+读，绝不出现在请求体或 URL 里。适配器实现在 `plugins/capability-hub/src/adapters/dashscope-tts.mjs`，
+先试 `aigc/multimodal-generation`，失败再试 `audio/tts/SpeechSynthesizer`（见
+`docs/research/world-gateway-qwen-maas-smoke.md`）。
 
 ## prepare / commit / abort
 

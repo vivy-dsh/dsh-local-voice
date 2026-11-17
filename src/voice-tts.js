@@ -3,8 +3,10 @@
 // 只做一件事，且失败要**可读**——桥接那层会把它翻译成 502 交给模型，
 // 模型据此决定「改回打字」而不是编一句「我发了语音」。
 //
-// 与 voxd 的契约见 ../voice/README.md：POST /v1/speak/file → wav 字节，
-// X-Duration-Ms 是时长（毫秒），X-Cached 表示是否命中服务端缓存。
+// 两种上游契约：
+// - voxd（`voice-local` / `voice-cloud`）：POST /v1/speak/file → wav 字节，
+//   X-Duration-Ms 是时长（毫秒），X-Cached 表示是否命中服务端缓存。
+// - 世界网关（`voice-dashscope`）：POST {gateway endpoint}/tts，由 capability-hub 转发到百炼。
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,6 +67,30 @@ export function wavDurationMs(buf) {
 }
 
 /**
+ * 修百炼 TTS 直出的 wav 头：它按流式写，`data` 块声明长度是 0x7FFFFFFF 一类的占位值，
+ * 实际字节少得多。不修的话播放器会以为这是十几个小时的音频。
+ *
+ * 只认「RIFF/WAVE 且 data 长度超出实际剩余字节」这一种畸形；正常的 wav 原样返回同一个 Buffer，
+ * 免得给 voxd 那条老路平白多一次拷贝。修不了（缺 fmt、找不到 data）也原样返回。
+ */
+export function repairWavHeader(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 44) return buf;
+  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return buf;
+  const dataOff = buf.indexOf('data', 12, 'ascii');
+  if (dataOff < 0 || dataOff + 8 > buf.length) return buf;
+  const declared = buf.readUInt32LE(dataOff + 4);
+  const actual = buf.length - dataOff - 8;
+  // 声明的长度比实际多，或者大到离谱，都按实际大小重写。
+  if (declared <= actual && declared <= 0x7fffffff) return buf;
+  const fixed = Buffer.alloc(buf.length);
+  buf.copy(fixed);
+  fixed.writeUInt32LE(actual, dataOff + 4);
+  fixed.writeUInt32LE(fixed.length - 8, 4);
+  return fixed;
+}
+
+/**
+ * @param speakPathOverride - 上游合成路径：voxd 用 `/v1/speak/file`（默认），世界网关用 `/tts`
  * @returns {Promise<{path:string,durationMs:number,cached:boolean}>}
  * @throws  Error（message 已可直接展示给模型/操作者）
  */
@@ -77,6 +103,7 @@ export async function synthesizeToFile({
   timeoutMs = 60000,
   cacheVersion = null,
   outDir,
+  speakPath: speakPathOverride = '',
   fetchImpl = fetch,
   signal
 } = {}) {
@@ -102,9 +129,12 @@ export async function synthesizeToFile({
   if (voice) body.voice = String(voice);
   if (style && typeof style === 'object') body.style = style;
 
+  // 两条上游的路径约定不同：voxd 是 `/v1/speak/file`，世界网关是 `/tts`。
+  // 由调用方显式给 `path`，不在这里猜——猜错会让人以为是网络问题。
+  const speakPath = String(speakPathOverride || '/v1/speak/file');
   let res;
   try {
-    res = await fetchImpl(`${url}/v1/speak/file`, {
+    res = await fetchImpl(`${url}${speakPath}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -116,7 +146,9 @@ export async function synthesizeToFile({
     const hint =
       error?.name === 'TimeoutError'
         ? `合成超时（>${Math.round(timeoutMs / 1000)}s）`
-        : 'TTS 服务没起来（voxd 是否在运行？）';
+        : speakPath === '/tts'
+          ? '连不上世界网关（宿主是否在运行？）'
+          : 'TTS 服务没起来（voxd 是否在运行？）';
     throw new Error(`${hint}：${error?.message ?? error}`);
   }
 
@@ -131,16 +163,19 @@ export async function synthesizeToFile({
   const buf = await readVoiceResponse(res);
   signal?.throwIfAborted();
   if (buf.length <= 44) throw new Error('TTS 返回了空音频');
+  // 百炼直出的 wav 头长度是流式占位值；正常包原样返回，只有畸形才重写。
+  const audio = repairWavHeader(buf);
 
   const tmp = `${file}.${crypto.randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(tmp, buf, { flag: 'wx', mode: 0o600 });
+    fs.writeFileSync(tmp, audio, { flag: 'wx', mode: 0o600 });
     fs.renameSync(tmp, file);
   } catch (error) { try { fs.unlinkSync(tmp); } catch {} throw error; }
   pruneCache(outDir);
 
-  const dur = Number(res.headers.get('x-duration-ms')) || 0;
-  return { path: file, durationMs: dur, cached: res.headers.get('x-cached') === '1' };
+  // 网关不保证回 X-Duration-Ms：先用头里的，实在没有再算一次，别让调用方拿到 0 秒。
+  const headerMs = Number(res.headers.get('x-duration-ms')) || 0;
+  return { path: file, durationMs: headerMs || wavDurationMs(audio), cached: res.headers.get('x-cached') === '1' };
 }
 
 /**

@@ -27,10 +27,16 @@ export function classifyVoiceError(message) {
       hint: '本地语音服务没在监听：到「语音」页点对应语音包的「启动」，或检查端口是否被占用',
     };
   }
-  if (has(/401|403|鉴权|AppKey|Access.?Key|resource|余额|quota|欠费|未授权/i)) {
+  if (has(/401|403|鉴权|AppKey|Access.?Key|resource|余额|quota|欠费|未授权|InvalidApiKey|invalid_api_key/i)) {
     return {
       code: 'voice.upstream-auth', stage: 'upstream',
-      hint: '云端鉴权失败：检查 AppID / Access Key / resource id（seed-icl-2.0）是否有效、是否欠费',
+      hint: '云端鉴权失败：检查语音包的 AppID / Access Key / resource id（seed-icl-2.0），或世界网关的凭据是否有效、是否欠费',
+    };
+  }
+  if (has(/世界网关|voice\.gateway|gateway 未/i)) {
+    return {
+      code: 'voice.upstream-gateway', stage: 'upstream',
+      hint: '世界网关没接上：到「设置 → 世界网关」确认 tts 插槽已启用、模型与凭据都填了，再试',
     };
   }
   if (has(/TTS 服务返回\s*5\d\d|没有引擎能满足/i)) {
@@ -43,7 +49,7 @@ export function classifyVoiceError(message) {
   if (has(/云端合成失败|网络\s*\？|timeout|TimeoutError|ETIMEDOUT|ENOTFOUND|5\d\d/i)) {
     return {
       code: 'voice.upstream-network', stage: 'upstream',
-      hint: '云端上游（火山）网络/服务异常：稍后重试；持续失败可切到本地包应急',
+      hint: '云端上游网络/服务异常：稍后重试；持续失败可切到本地包应急',
     };
   }
   return {
@@ -56,11 +62,15 @@ export function classifyVoiceError(message) {
  * 云端失败时是否值得换一条路重试。
  * 只在“另一条路的地址不同、且本次失败属于可重试类别”时返回该 route，否则返回 ''。
  * 限流/配置错误换路也没用，不重试。
+ *
+ * 第三条线路（voice-dashscope）只在明确给了 `backup` 时才参与：否则沿用原来
+ * 「另外那一条」的语义，避免三线并存时把主语悄悄换掉。
  */
-export function pickFallbackRoute(primary, endpoints, errorCode) {
+export function pickFallbackRoute(primary, endpoints, errorCode, backup = '') {
   const retryable = new Set(['voice.upstream-network', 'voice.upstream-auth', 'voice.service-down', 'voice.engine-failed']);
   if (!retryable.has(String(errorCode))) return '';
-  const other = primary === 'cloud' ? 'local' : 'cloud';
+  const other = String(backup || '') || (primary === 'cloud' ? 'local' : 'cloud');
+  if (!other || other === primary) return '';
   const a = String(endpoints?.[primary] ?? '').trim();
   const b = String(endpoints?.[other] ?? '').trim();
   if (!b || a === b) return '';
