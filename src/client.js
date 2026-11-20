@@ -1025,6 +1025,13 @@ window.__ModuleLoader__.load({
     const packStatus = pack => pack.running ? '运行中' : pack.managed ? '预热中' : pack.installed ? '已安装 · 已停止' : '未安装'
     const packTone = pack => pack.running ? 'ok' : pack.managed ? 'warn' : pack.installed ? 'info' : 'bad'
 
+    // 「现在到底走哪家」只在这一处定义：线路 → 它实际用的语音包。
+    // 之前总览把 dashscope 线路显示成「本地合成」，就是各页各写一套说法导致的。
+    const ROUTE_PACK_ID = { local: 'voice-local', cloud: 'voice-cloud', dashscope: 'voice-dashscope' }
+    const ROUTE_PACK_NAME = { local: '本地语音包', cloud: '云端语音包', dashscope: '世界网关语音包' }
+    const routeLabel = route => ROUTE_PACK_NAME[route] ?? '线路未读取'
+    const routePackId = route => ROUTE_PACK_ID[route] ?? null
+
     function asrEngine(state) {
       const catalog = state.asr.catalog
       return catalog?.engines?.find(item => item.id === catalog?.engine) ?? null
@@ -1056,12 +1063,13 @@ window.__ModuleLoader__.load({
         return [
           row([
             chip(asr.draft.enabled ? '识别已开启' : '识别已关闭', asr.draft.enabled ? 'ok' : 'warn'),
+            chip(engine ? `${engine.name} · ${engine.location === 'cloud' ? '云端' : '本机'}` : `引擎 ${asr.draft.engine}`, engine?.location === 'cloud' ? 'info' : ''),
             chip(engine?.ready ? '模型已就绪' : '模型未就绪', engine?.ready ? 'ok' : 'warn'),
-            engine?.worker?.running ? chip(`识别进程 pid ${engine.worker.pid}`, 'info') : chip('识别进程按需启动', ''),
+            engine?.worker?.running ? chip(`识别进程 pid ${engine.worker.pid}`, 'info') : null,
           ]),
           check('启用语音识别', asr.draft.enabled, value => store.editAsr({ enabled: value })),
-          hint(`引擎 ${engine?.name ?? asr.draft.engine} · 单条 ${asr.draft.maxSeconds}s / ${asr.draft.maxBytesMiB}MiB · 每分钟 ${asr.draft.maxPerMinute} 次`),
-          hint('详细参数与模型准备在「识别」页；输入框左侧的麦克风仍可直接录音。'),
+          hint(`当前识别来源：${engine?.name ?? asr.draft.engine}（${engine?.location === 'cloud' ? '云端 · 走世界网关' : '本机 · 不上传音频'}）· 单条 ${asr.draft.maxSeconds}s / ${asr.draft.maxBytesMiB}MiB · 每分钟 ${asr.draft.maxPerMinute} 次`),
+          hint('换引擎在「识别」页；输入框左侧的麦克风与它同一个来源。'),
           saveBar('asr-save', asr, asrDirty, () => { void store.saveAsr() }, () => store.discardAsr()),
         ]
       }
@@ -1074,12 +1082,13 @@ window.__ModuleLoader__.load({
           row([
             chip(tts.draft.enabled ? '语音已开启' : '语音已关闭', tts.draft.enabled ? 'ok' : 'warn'),
             chip(tts.draft.aiEnabled ? '合成已开启' : '合成已关闭', tts.draft.aiEnabled ? 'ok' : 'warn'),
-            chip(tts.draft.route === 'cloud' ? '云端线路' : tts.draft.route === 'dashscope' ? '世界网关线路' : '本地线路', 'info'),
+            chip(routeLabel(tts.draft.route), 'info'),
+            chip(`音色 ${tts.draft.character || '默认'}`, ''),
             chip(`已安装 ${installed.length} · 运行中 ${running.length}`, running.length ? 'ok' : ''),
           ]),
           check('允许机器人发送语音', tts.draft.enabled, value => store.editTts({ enabled: value })),
           check('允许语音合成', tts.draft.aiEnabled, value => store.editTts({ aiEnabled: value })),
-          hint('触发、线路、音色与合成参数在「合成」页；语音包、语音库与云端配置在对应页面。'),
+          hint(`当前合成来源：${routeLabel(tts.draft.route)}（${tts.draft.route === 'dashscope' ? '云端 · 由世界网关转发到千问' : tts.draft.route === 'cloud' ? '云端' : '本机'}）。换线路在「合成」页。`),
           saveBar('tts-save', tts, ttsDirty, () => { void store.saveTts() }, () => store.discardTts()),
         ]
       }
@@ -1091,17 +1100,18 @@ window.__ModuleLoader__.load({
             stat('running', '运行中', running.length, '个', running.length ? 'ok' : ''),
             stat('library', '语音库文件', state.voice.library ? state.voice.library.count : '—', state.voice.library ? '个' : ''),
             stat('cloud', '本月合成', tts.cloud ? (tts.cloud.monthChars ?? 0) : '—', tts.cloud ? '字' : '')),
-          hint(`当前线路：${tts.saved?.route === 'cloud' ? '云端合成' : tts.saved ? '本地合成' : '线路未读取'}${tts.saved?.enabled ? ' · 已允许机器人发送语音' : tts.saved ? ' · 语音发送已关闭' : ''}。`),
+          hint(`当前线路：${tts.saved ? routeLabel(tts.saved.route) : '线路未读取'}${tts.saved?.enabled ? ' · 已允许机器人发送语音' : tts.saved ? ' · 语音发送已关闭' : ''}。`),
           tts.packs.length
             ? tts.packs.map(pack => item(pack.id, [
               h('span', null, pack.name),
+              routePackId(tts.saved?.route) === pack.id ? chip('当前合成来源', 'ok') : null,
               chip(packStatus(pack), packTone(pack)),
               hint(pack.installed ? `${pack.running ? '运行中' : pack.managed ? '等待就绪' : '未运行'}${pack.port ? ` · 端口 ${pack.port}` : ''}` : '尚未安装'),
             ]))
             : empty('尚未发现语音包。'),
         ]),
-        card('asr', '语音识别', asrBody(), '把录音变成文字；默认本机 SenseVoice。'),
-        card('tts', '语音合成', ttsBody(), '把文字变成语音；线路与音色决定实际引擎。'),
+        card('asr', '语音识别', asrBody(), '把录音变成文字；本机 SenseVoice 或世界网关（千问）二选一。'),
+        card('tts', '语音合成', ttsBody(), '把文字变成语音；线路决定用本地语音包还是世界网关。'),
         card('cloud', '云端用量', [
           tts.packs.some(pack => pack.id === 'voice-cloud' && pack.installed)
             ? tts.cloud
@@ -1150,6 +1160,9 @@ window.__ModuleLoader__.load({
             field('识别引擎', select(draft.engine, engines, value => store.editAsr({ engine: value }), '识别引擎')),
             field('默认语言', select(draft.language, LANGUAGES, value => store.editAsr({ language: value }), '默认语言')),
           ]),
+          // 来源与就绪状态写在引擎选择旁边：换了引擎却不知道它在等什么，是最常见的困惑。
+          hint(`当前来源：${engine?.name ?? draft.engine}（${engine?.location === 'cloud' ? '云端 · 音频会发给世界网关' : '本机 · 音频不离开这台机器'}）${engine?.ready ? ' · 已就绪' : engine?.error ? ` · 未就绪：${engine.error}` : ' · 未就绪'}`),
+          draft.engine === 'gateway' ? hint('世界网关的识别模型、凭据与插槽开关在「世界网关」面板里；这里只负责选它。') : null,
         ]),
         card('limits', '限额', [
           fields([
@@ -1165,6 +1178,7 @@ window.__ModuleLoader__.load({
           field('最多保留条数', numberInput(draft.maxEntries, value => store.editAsr({ maxEntries: value }), '缓存条数', { min: 1 })),
         ]),
         card('sensevoice', 'SenseVoice 参数', [
+          hint(draft.engine === 'gateway' ? '这些参数只对「本机 SenseVoice」生效；当前用的是世界网关，改它们不会影响识别。' : '这些参数只对「本机 SenseVoice」生效。'),
           fields([
             field('模型精度', select(draft.precision, PRECISIONS, value => store.editAsr({ precision: value }), '模型精度')),
             field('线程数', numberInput(draft.threads, value => store.editAsr({ threads: value }), '线程数', { min: 1 })),
@@ -1307,8 +1321,11 @@ window.__ModuleLoader__.load({
             ? check('我了解此包没有完整性校验，仍要导入', voice.allowUnverified, value => store.setAllowUnverified(value))
             : null,
         ]),
-        card('packs', '语音包', tts.packs.length ? tts.packs.map(pack => h('article', { key: pack.id, className: 'vc-pack' },
-          h('div', { className: 'vc-pack-head' }, h('strong', null, pack.name), chip(packStatus(pack), packTone(pack))),
+        card('gen', '语音包', tts.packs.length ? tts.packs.map(pack => h('article', { key: pack.id, className: 'vc-pack' },
+          h('div', { className: 'vc-pack-head' },
+            h('strong', null, pack.name),
+            routePackId(tts.saved?.route) === pack.id ? chip('当前合成来源', 'ok') : chip('未使用', ''),
+            chip(packStatus(pack), packTone(pack))),
           h('p', null, `${pack.installed ? '已安装' : '未安装'} · ${pack.running ? '运行中' : pack.managed ? '进程运行中（等待就绪或需停止）' : '未运行'}`),
           pack.sizeBytes != null ? h('p', null, `预计大小：${formatSize(pack.sizeBytes)}`) : null,
           pack.port ? h('p', null, `服务端口：${pack.port}${pack.enginePort ? ` · 引擎端口：${pack.enginePort}（${pack.engineUp ? '运行中' : '未运行'}）` : ''}`) : null,
